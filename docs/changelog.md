@@ -1,5 +1,8 @@
 # Changelog
 
+## In development
+- Add component-based selective installation via the `components` argument of {any}`installer.install`, using the new {any}`installer.components.Components` configuration: callers group wheel files into named components with POSIX-relative glob patterns (`*`, `?`, standalone `**`) and select which components to install, with a configurable keep/exclude default for unmatched files
+
 ## v1.1.0 (Oct 12, 2026)
 - Add early return when there are no optimization levels to compile bytecode for (#341)
 - Avoid building a `pathlib.Path` object for each record entry (#342)

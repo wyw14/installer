@@ -7,3 +7,7 @@ class InstallerError(Exception):
 
 class InvalidWheelSource(InstallerError):
     """When a wheel source violates a contract, or is not supported."""
+
+
+class InvalidComponents(InstallerError, ValueError):
+    """When caller-provided component selection configuration is invalid."""
