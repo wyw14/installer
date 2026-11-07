@@ -1,5 +1,14 @@
 # Changelog
 
+## unreleased
+- Add `installer.install_for_target`, `installer.check_compatibility` and
+  `installer.Target`, for installing a wheel after verifying it against an
+  explicitly described target environment (ordered wheel tags, exact Python
+  version and launcher kind), without inferring anything from the host
+  platform. Wheel filename tags are Cartesian-expanded and must match all
+  `Tag` fields in `WHEEL`; `Requires-Python` is checked against the exact
+  target version, and the launcher kind must fit the target platform.
+
 ## v1.1.0 (Oct 12, 2026)
 - Add early return when there are no optimization levels to compile bytecode for (#341)
 - Avoid building a `pathlib.Path` object for each record entry (#342)

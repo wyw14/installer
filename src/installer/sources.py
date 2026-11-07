@@ -62,6 +62,16 @@ class WheelSource:
         return f"{self.distribution}-{self.version}.data"
 
     @property
+    def wheel_tag(self) -> str:
+        """Compressed ``{interpreter}-{ABI}-{platform}`` tag from the wheel filename.
+
+        Compressed tag sets (using ``.`` to join multiple interpreters, ABIs or
+        platforms) are returned as-is, and the caller is responsible for
+        expanding them.
+        """
+        raise NotImplementedError
+
+    @property
     def dist_info_filenames(self) -> list[str]:
         """Get names of all files in the dist-info directory.
 
@@ -211,6 +221,15 @@ class WheelFile(WheelSource):
             )
 
         return dist_info_dir
+
+    @cached_property
+    def wheel_tag(self) -> str:
+        """Compressed ``{interpreter}-{ABI}-{platform}`` tag from the wheel filename."""
+        assert self._zipfile.filename is not None
+        wheel_filename = Path(self._zipfile.filename).name
+        tag = parse_wheel_filename(wheel_filename).tag
+        assert isinstance(tag, str)
+        return tag
 
     @property
     def dist_info_filenames(self) -> list[str]:

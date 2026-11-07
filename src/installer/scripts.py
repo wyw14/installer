@@ -17,8 +17,16 @@ if TYPE_CHECKING:
     LauncherKind = Literal["posix", "win-ia32", "win-amd64", "win-arm", "win-arm64"]
     ScriptSection = Literal["console", "gui"]
 
+#: Every launcher kind supported by :class:`Script`.
+LAUNCHER_KINDS: tuple["LauncherKind", ...] = (
+    "posix",
+    "win-ia32",
+    "win-amd64",
+    "win-arm",
+    "win-arm64",
+)
 
-__all__ = ["InvalidScript", "Script"]
+__all__ = ["LAUNCHER_KINDS", "InvalidScript", "Script"]
 
 
 _ALLOWED_LAUNCHERS: Mapping[tuple["ScriptSection", "LauncherKind"], str] = {
