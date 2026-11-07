@@ -9,7 +9,7 @@ import os
 import re
 import sys
 from collections import namedtuple
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from configparser import ConfigParser
 from email.message import Message
 from email.parser import FeedParser
@@ -171,23 +171,54 @@ def get_launcher_kind() -> "LauncherKind":  # pragma: no cover
     raise NotImplementedError("Unknown launcher kind for this machine")
 
 
+def _is_python_placeholder_shebang(line: bytes) -> bool:
+    """Whether a script's first line is a wheel ``#!python``/``#!pythonw`` placeholder."""
+    if not line.startswith(b"#!"):
+        return False
+    tokens = line[2:].rstrip(b"\r\n").split()
+    return bool(tokens) and tokens[0] in (b"python", b"pythonw")
+
+
 @contextlib.contextmanager
-def fix_shebang(stream: BinaryIO, interpreter: str) -> Iterator[BinaryIO]:
+def fix_shebang(
+    stream: BinaryIO,
+    interpreter: str,
+    interpreter_args: Sequence[str] = (),
+) -> Iterator[BinaryIO]:
     """Replace ``#!python`` shebang in a stream with the correct interpreter.
+
+    Only a first line whose interpreter is exactly the ``python`` or
+    ``pythonw`` wheel placeholder is replaced; every other shebang (and
+    non-shebang content) is passed through unchanged. When a replacement
+    happens, the rest of the stream is copied byte-for-byte.
 
     :param stream: stream to modify
     :param interpreter: "correct interpreter" to substitute the shebang with
+    :param interpreter_args: exact arguments to invoke the interpreter with,
+        before the script and the caller's arguments. When non-empty, the
+        plain shebang is replaced with a POSIX ``/bin/sh`` polyglot wrapper
+        that passes the arguments with exact argv boundaries.
 
     :returns: A context manager, that provides an appropriately modified stream.
     """
+    # Imported lazily, to keep installer.utils free of cross-module imports.
+    from installer.scripts import build_posix_wrapper, validate_interpreter
+
+    interpreter_args = tuple(interpreter_args)
+    validate_interpreter(interpreter, interpreter_args)
+
     stream.seek(0)
-    if stream.read(8) == b"#!python":
+    first_line = stream.readline()
+    if _is_python_placeholder_shebang(first_line):
         new_stream = io.BytesIO()
-        # write our new shebang
-        new_stream.write(f"#!{interpreter}\n".encode())
-        # copy the rest of the stream
-        stream.seek(0)
-        stream.readline()  # skip first line
+        if interpreter_args:
+            # The wrapper ends without a newline; add one before the body so
+            # that the original script starts on the following line.
+            new_stream.write(build_posix_wrapper(interpreter, interpreter_args) + b"\n")
+        else:
+            # write our new shebang
+            new_stream.write(b"#!" + interpreter.encode("utf-8") + b"\n")
+        # copy the rest of the stream (the first line was consumed above)
         while True:
             buf = stream.read(_COPY_BUFSIZE)
             if not buf:

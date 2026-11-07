@@ -2,7 +2,7 @@
 
 import io
 import os
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import (
@@ -12,7 +12,7 @@ from typing import (
 )
 
 from installer.records import Hash, RecordEntry
-from installer.scripts import Script
+from installer.scripts import Script, validate_interpreter
 from installer.utils import (
     _WINDOWS,
     Scheme,
@@ -111,6 +111,16 @@ class SchemeDictionaryDestination(WheelDestination):
     script_kind: "LauncherKind"
     """The "kind" of launcher script to use."""
 
+    interpreter_args: Sequence[str] = ()
+    """Exact arguments to invoke the interpreter with for generated scripts.
+
+    The arguments are placed between the interpreter and the script, and
+    each one is passed as a separate literal argv entry (empty strings and
+    quotes are preserved as-is). Only supported with the ``"posix"``
+    ``script_kind``; combining arguments with a Windows launcher raises
+    :class:`~installer.scripts.InvalidScript`.
+    """
+
     hash_algorithm: str = "sha256"
     """
     The hashing algorithm to use, which is a member of
@@ -134,6 +144,16 @@ class SchemeDictionaryDestination(WheelDestination):
 
     overwrite_existing: bool = False
     """Silently overwrite existing files."""
+
+    def __post_init__(self) -> None:
+        # Normalise to a tuple, so the configuration is immutable and can be
+        # safely reused for every generated script.
+        args = tuple(self.interpreter_args)
+        self.interpreter_args = args
+        # Reject invalid invocations up front, before any file is written.
+        validate_interpreter(
+            self.interpreter, args, for_launcher=self.script_kind != "posix"
+        )
 
     def _path_with_destdir(self, scheme: Scheme, path: str) -> Path:
         # See https://docs.python.org/3/library/zipfile.html#zipfile.Path:
@@ -214,7 +234,9 @@ class SchemeDictionaryDestination(WheelDestination):
         path_ = os.fspath(path)
 
         if scheme == "scripts":
-            with fix_shebang(stream, self.interpreter) as stream_with_different_shebang:
+            with fix_shebang(
+                stream, self.interpreter, self.interpreter_args
+            ) as stream_with_different_shebang:
                 return self.write_to_fs(
                     scheme, path_, stream_with_different_shebang, is_executable
                 )
@@ -239,7 +261,9 @@ class SchemeDictionaryDestination(WheelDestination):
           filesystem interaction.
         """
         script = Script(name, module, attr, section)
-        script_name, data = script.generate(self.interpreter, self.script_kind)
+        script_name, data = script.generate(
+            self.interpreter, self.script_kind, self.interpreter_args
+        )
 
         with io.BytesIO(data) as stream:
             entry = self.write_to_fs(

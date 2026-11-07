@@ -9,6 +9,7 @@ from io import BytesIO
 import pytest
 
 from installer.records import RecordEntry
+from installer.scripts import InvalidScript, build_posix_wrapper
 from installer.utils import (
     WheelFilename,
     canonicalize_name,
@@ -189,6 +190,101 @@ class TestScript:
         with BytesIO(data) as source, fix_shebang(source, "/my/python") as stream:
             result = stream.read()
         assert result == data
+
+    @pytest.mark.parametrize(
+        ("data", "placeholder"),
+        [
+            pytest.param(b"#!python\ntest", b"#!python\n", id="python"),
+            pytest.param(b"#!pythonw\ntest", b"#!pythonw\n", id="pythonw"),
+            pytest.param(
+                b"#!python -x\ntest", b"#!python -x\n", id="python-with-old-args"
+            ),
+        ],
+    )
+    def test_replace_shebang_with_interpreter_args(self, data, placeholder):
+        with (
+            BytesIO(data) as source,
+            fix_shebang(source, "/my/python", ["-I", "-X", "utf8"]) as stream,
+        ):
+            result = stream.read()
+
+        expected = (
+            build_posix_wrapper("/my/python", ["-I", "-X", "utf8"])
+            + b"\n"
+            + data[len(placeholder) :]
+        )
+        assert result == expected
+        # The polyglot prefix plus the preserved body stays valid Python.
+        compile(result, "<script>", "exec")
+
+    def test_interpreter_args_preserve_body_bytes(self):
+        body = b"\r\n\x00\xff arbitrary bytes\t\xc3\xa9\r\nlast line"
+        data = b"#!python\n" + body
+        with (
+            BytesIO(data) as source,
+            fix_shebang(source, "/my/python", ["-I"]) as stream,
+        ):
+            result = stream.read()
+
+        assert result == build_posix_wrapper("/my/python", ["-I"]) + b"\n" + body
+
+    def test_interpreter_args_without_trailing_newline(self):
+        with (
+            BytesIO(b"#!python") as source,
+            fix_shebang(source, "/my/python", ["-I"]) as stream,
+        ):
+            result = stream.read()
+        assert result == build_posix_wrapper("/my/python", ["-I"]) + b"\n"
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            b"#!py\ntest",
+            b"#!pythonx\ntest",
+            b"#!/bin/sh\ntest",
+            b"#!something\ntest",
+            b"#something\ntest",
+            b"something",
+        ],
+    )
+    def test_keep_other_shebangs_with_interpreter_args(self, data):
+        # Only the wheel ``#!python``/``#!pythonw`` placeholders are replaced;
+        # other shebangs must not be touched, even when args are configured.
+        with (
+            BytesIO(data) as source,
+            fix_shebang(source, "/my/python", ["-I"]) as stream,
+        ):
+            result = stream.read()
+        assert result == data
+
+    @pytest.mark.parametrize(
+        ("interpreter", "interpreter_args"),
+        [
+            ("/bad\x00python", ["-I"]),
+            ("/bad\npython", ["-I"]),
+            ("/my/python", ["a\rb"]),
+            ("/my/python", ["a\x00b"]),
+            ("/my/python", ["ok", "a\nb"]),
+        ],
+    )
+    def test_rejects_forbidden_characters(self, interpreter, interpreter_args):
+        with (
+            pytest.raises(InvalidScript, match="forbidden character"),
+            BytesIO(b"#!python\nbody") as source,
+            fix_shebang(source, interpreter, interpreter_args),
+        ):
+            pass
+
+    def test_rejects_before_generating_bytes(self):
+        # The replacement stream is never produced when validation fails.
+        source = BytesIO(b"#!python\nbody")
+        with (
+            pytest.raises(InvalidScript),
+            fix_shebang(source, "/my/python", ["bad\narg"]),
+        ):
+            pass
+        source.seek(0)
+        assert source.read() == b"#!python\nbody"
 
 
 class TestConstructRecord:

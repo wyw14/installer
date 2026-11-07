@@ -5,7 +5,7 @@ import pytest
 
 from installer.destinations import SchemeDictionaryDestination, WheelDestination
 from installer.records import RecordEntry
-from installer.scripts import Script
+from installer.scripts import InvalidScript, Script
 from installer.utils import SCHEME_NAMES
 
 
@@ -197,3 +197,90 @@ class TestSchemeDictionaryDestination:
     def test_blocking_path_traversal(self, destination):
         with pytest.raises(ValueError):
             destination._path_with_destdir("purelib", "subdir/../../outside.txt")
+
+    @pytest.mark.parametrize(
+        "kind",
+        ["win-ia32", "win-amd64", "win-arm", "win-arm64"],
+    )
+    def test_rejects_interpreter_args_with_windows_launcher(self, tmp_path, kind):
+        scheme_dict = {"scripts": str(tmp_path)}
+        with pytest.raises(InvalidScript, match="posix"):
+            SchemeDictionaryDestination(
+                scheme_dict, "C:\\Python\\python.exe", kind, ["-I"]
+            )
+        # Rejection happens at construction time, before anything is written.
+        assert list(Path(scheme_dict["scripts"]).iterdir()) == []
+
+    def test_rejects_forbidden_characters_before_writing(self, tmp_path):
+        scheme_dict = {"scripts": str(tmp_path)}
+        with pytest.raises(InvalidScript, match="forbidden character"):
+            SchemeDictionaryDestination(scheme_dict, "/my/python", "posix", ["-I\n"])
+        assert list(Path(scheme_dict["scripts"]).iterdir()) == []
+
+    def test_interpreter_args_stored_as_tuple(self, tmp_path):
+        scheme_dict = {"scripts": str(tmp_path)}
+        args = ["-I", "-X", "utf8"]
+        destination = SchemeDictionaryDestination(
+            scheme_dict, "/my/python", "posix", args
+        )
+        assert destination.interpreter_args == ("-I", "-X", "utf8")
+        assert isinstance(destination.interpreter_args, tuple)
+
+    def test_write_script_with_interpreter_args(self, tmp_path):
+        scheme_dict = {}
+        for scheme in SCHEME_NAMES:
+            full_path = tmp_path / scheme
+            full_path.mkdir()
+            scheme_dict[scheme] = str(full_path)
+        args = ["-I", "-X", "utf8"]
+        destination = SchemeDictionaryDestination(
+            scheme_dict, "/opt/Python Env/bin/python", "posix", args
+        )
+
+        script_args = ("my_entrypoint", "my_module", "my_function", "console")
+        record = destination.write_script(*script_args)
+        file_path = Path(destination.scheme_dict["scripts"]) / "my_entrypoint"
+
+        file_data = file_path.read_bytes()
+        _, expected_data = Script(*script_args).generate(
+            "/opt/Python Env/bin/python", "posix", args
+        )
+        assert file_data == expected_data
+        assert record.path == "my_entrypoint"
+        assert record.size == len(file_data)
+        assert record.hash_.validate(file_data)
+
+    def test_write_file_with_interpreter_args(self, tmp_path):
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        scheme_dict = {"scripts": str(scripts_dir)}
+        destination = SchemeDictionaryDestination(
+            scheme_dict, "/opt/Python Env/bin/python", "posix", ["-I", ""]
+        )
+
+        body = b"import sys\nsys.exit(0)\n"
+        record = destination.write_file(
+            "scripts",
+            "my_script.py",
+            io.BytesIO(b"#!python\n" + body),
+            False,
+        )
+
+        file_data = (scripts_dir / "my_script.py").read_bytes()
+        assert file_data.startswith(b"#!/bin/sh\n'''exec' ")
+        assert b"'/opt/Python Env/bin/python' -I '' " in file_data
+        assert file_data.endswith(body)
+        assert record.size == len(file_data)
+        assert record.hash_.validate(file_data)
+
+    def test_write_file_other_shebang_unmodified_with_interpreter_args(self, tmp_path):
+        scripts_dir = tmp_path / "scripts"
+        scripts_dir.mkdir()
+        scheme_dict = {"scripts": str(scripts_dir)}
+        destination = SchemeDictionaryDestination(
+            scheme_dict, "/opt/Python Env/bin/python", "posix", ["-I"]
+        )
+
+        data = b"#!/bin/sh\necho hi\n"
+        destination.write_file("scripts", "other", io.BytesIO(data), False)
+        assert (scripts_dir / "other").read_bytes() == data
