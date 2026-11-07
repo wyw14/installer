@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+- Add an explicit reproducible artifacts mode, enabled with
+  `SchemeDictionaryDestination(reproducible=True)` (and the CLI's
+  `--reproducible` / `--source-date-epoch` options). In this mode, bytecode is
+  compiled with checked-hash invalidation and embeds only the final runtime
+  path, Windows launchers embed ZIP archives with fixed member metadata,
+  optimization levels are validated and de-duplicated, compilation errors
+  fail the installation, and the generated `.pyc` files are recorded in
+  `RECORD` with their actual hash and size.
+
 ## v1.1.0 (Oct 12, 2026)
 - Add early return when there are no optimization levels to compile bytecode for (#341)
 - Avoid building a `pathlib.Path` object for each record entry (#342)

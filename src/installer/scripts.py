@@ -3,6 +3,7 @@
 import io
 import os
 import shlex
+import stat
 import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -10,8 +11,11 @@ from importlib.resources import files
 from typing import TYPE_CHECKING
 
 from installer import _scripts
+from installer.utils import source_date_epoch_to_zip_date_time
 
 if TYPE_CHECKING:
+    from installer.utils import ZipDateTime
+
     from typing import Literal
 
     LauncherKind = Literal["posix", "win-ia32", "win-amd64", "win-arm", "win-arm64"]
@@ -88,7 +92,13 @@ class Script:
             executable = os.path.join(dn, fn)  # noqa: PTH118
         return executable
 
-    def generate(self, executable: str, kind: "LauncherKind") -> tuple[str, bytes]:
+    def generate(
+        self,
+        executable: str,
+        kind: "LauncherKind",
+        *,
+        source_date_epoch: int | None = None,
+    ) -> tuple[str, bytes]:
         """Generate a launcher for this script.
 
         :param executable: Path to the executable to invoke.
@@ -96,8 +106,15 @@ class Script:
             Valid values are ``"posix"``, ``"win-ia32"``, ``"win-amd64"`` and
             ``"win-arm"``.
         :type kind: str
-
+        :param source_date_epoch: When given, produce a reproducible Windows
+            launcher, whose embedded ZIP uses this POSIX timestamp (interpreted
+            in UTC) for its member date/time, along with fixed member order,
+            permissions and compression. When ``None`` (the default), the
+            current wall-clock time is used, as in the non-reproducible
+            behaviour. This does not affect POSIX launchers.
         :raises InvalidScript: if no appropriate template is available.
+        :raises installer.exceptions.InvalidSourceDateEpoch: if
+            ``source_date_epoch`` is not representable in a ZIP archive.
         :return: The name and contents of the launcher file.
         """
         launcher = self._get_launcher_data(kind)
@@ -113,11 +130,35 @@ class Script:
             return self.name, shebang + b"\n" + code
 
         stream = io.BytesIO()
-        with zipfile.ZipFile(stream, "w") as zf:
-            zf.writestr("__main__.py", code)
+        with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_STORED) as zf:
+            if source_date_epoch is None:
+                zf.writestr("__main__.py", code)
+            else:
+                zf.writestr(
+                    self._build_zip_info(
+                        "__main__.py",
+                        source_date_epoch_to_zip_date_time(source_date_epoch),
+                    ),
+                    code,
+                )
         name = f"{self.name}.exe"
         data = launcher + shebang + b"\n" + stream.getvalue()
         return name, data
+
+    @staticmethod
+    def _build_zip_info(name: str, date_time: "ZipDateTime") -> zipfile.ZipInfo:
+        """Build a ZipInfo with fixed, platform-independent member metadata."""
+        zinfo = zipfile.ZipInfo(name, date_time=date_time)
+        zinfo.compress_type = zipfile.ZIP_STORED
+        # Pin every field that could otherwise vary with the host platform,
+        # the current time or creation-order details.
+        zinfo.create_system = 3  # Unix, so external_attr is a Unix mode.
+        zinfo.create_version = 20
+        zinfo.extract_version = 20
+        zinfo.flag_bits = 0
+        zinfo.internal_attr = 0
+        zinfo.external_attr = (stat.S_IFREG | 0o644) << 16  # regular file, rw-r--r--
+        return zinfo
 
     @staticmethod
     def _is_executable_simple(executable: bytes) -> bool:

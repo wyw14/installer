@@ -2,6 +2,7 @@
 
 import io
 import os
+import posixpath
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,15 +12,22 @@ from typing import (
     Union,
 )
 
+from installer.exceptions import (
+    BytecodeCompilationError,
+    InvalidSourceDateEpoch,
+)
 from installer.records import Hash, RecordEntry
 from installer.scripts import Script
 from installer.utils import (
+    DEFAULT_SOURCE_DATE_EPOCH,
     _WINDOWS,
     Scheme,
     construct_record_file,
     copyfileobj_with_hashing,
     fix_shebang,
     make_file_executable,
+    normalize_bytecode_optimization_levels,
+    source_date_epoch_to_zip_date_time,
 )
 
 if TYPE_CHECKING:
@@ -135,6 +143,68 @@ class SchemeDictionaryDestination(WheelDestination):
     overwrite_existing: bool = False
     """Silently overwrite existing files."""
 
+    reproducible: bool = False
+    """
+    Produce reproducible installation artifacts.
+
+    When enabled, installing the same wheel into different staging
+    directories (``destdir``), for the same scheme paths, interpreter and
+    optimization levels, results in byte-for-byte identical installed files,
+    generated entry scripts and ``RECORD`` (filesystem timestamps of the
+    written files are not part of the artifacts).
+
+    Concretely this means:
+
+    - bytecode is compiled using checked-hash invalidation (see
+      :pep:`552`), so ``.pyc`` files embed a hash of the source instead of
+      its modification time or size; the embedded ``co_filename`` is the
+      final runtime path (derived from ``scheme_dict``), never ``destdir``
+      or a temporary directory;
+    - ``bytecode_optimization_levels`` is de-duplicated and only the levels
+      0, 1 and 2 are accepted;
+    - compilation errors fail the installation and refer to the logical
+      (final runtime) source path;
+    - Windows entry launchers embed ZIP archives with fixed member
+      date/time, order, permissions and compression -- never the current
+      wall-clock time;
+    - compiled ``.pyc`` files are recorded in ``RECORD`` with the hash and
+      size of the bytes actually written.
+
+    When disabled (the default), behaviour is unchanged.
+    """
+
+    source_date_epoch: int | None = None
+    """
+    POSIX timestamp (seconds since the UNIX epoch, interpreted in UTC) used
+    for the fixed metadata of reproducible artifacts. Only used when
+    ``reproducible`` is enabled.
+
+    When ``None``, :data:`installer.utils.DEFAULT_SOURCE_DATE_EPOCH`
+    (1980-01-01 00:00:00 UTC) is used. Values outside of the range that ZIP
+    archive members can represent (1980-01-01 00:00:00 UTC to
+    2107-12-31 23:59:58 UTC) are rejected.
+    """
+
+    def __post_init__(self) -> None:
+        if not self.reproducible:
+            if self.source_date_epoch is not None:
+                message = (
+                    "source_date_epoch can only be used together with"
+                    " reproducible=True."
+                )
+                raise InvalidSourceDateEpoch(message)
+            return
+
+        self.bytecode_optimization_levels = normalize_bytecode_optimization_levels(
+            self.bytecode_optimization_levels
+        )
+        if self.source_date_epoch is None:
+            self.source_date_epoch = DEFAULT_SOURCE_DATE_EPOCH
+        else:
+            # Validate eagerly, so invalid timestamps fail before any file is
+            # written, with a clear error message.
+            source_date_epoch_to_zip_date_time(self.source_date_epoch)
+
     def _path_with_destdir(self, scheme: Scheme, path: str) -> Path:
         # See https://docs.python.org/3/library/zipfile.html#zipfile.Path:
         #  When handling untrusted archives,
@@ -239,7 +309,14 @@ class SchemeDictionaryDestination(WheelDestination):
           filesystem interaction.
         """
         script = Script(name, module, attr, section)
-        script_name, data = script.generate(self.interpreter, self.script_kind)
+        if self.reproducible:
+            script_name, data = script.generate(
+                self.interpreter,
+                self.script_kind,
+                source_date_epoch=self.source_date_epoch,
+            )
+        else:
+            script_name, data = script.generate(self.interpreter, self.script_kind)
 
         with io.BytesIO(data) as stream:
             entry = self.write_to_fs(
@@ -253,23 +330,85 @@ class SchemeDictionaryDestination(WheelDestination):
 
             return entry
 
-    def _compile_bytecode(self, scheme: Scheme, record: RecordEntry) -> None:
-        """Compile bytecode for a single .py file."""
+    def _compile_bytecode(
+        self, scheme: Scheme, record: RecordEntry
+    ) -> list[RecordEntry]:
+        """Compile bytecode for a single ``.py`` file.
+
+        In the default mode this uses :mod:`compileall`'s timestamp-based
+        invalidation and returns an empty list (the generated ``.pyc`` files
+        are not part of ``RECORD``).
+
+        In reproducible mode the bytecode uses checked-hash invalidation and
+        one :class:`~installer.records.RecordEntry` per generated ``.pyc``
+        file is returned, so the caller can record the actual hash and size
+        of every final artifact.
+        """
         if not self.bytecode_optimization_levels or scheme not in (
             "purelib",
             "platlib",
         ):
-            return
-
-        import compileall
+            return []
+        if not record.path.endswith(".py"):
+            return []
 
         target_path = self._path_with_destdir(scheme, record.path)
-        dir_path_to_embed = (Path(self.scheme_dict[scheme]) / record.path).parent
+        logical_path = Path(self.scheme_dict[scheme]) / record.path
 
+        if not self.reproducible:
+            import compileall
+
+            dir_path_to_embed = logical_path.parent
+
+            for level in self.bytecode_optimization_levels:
+                compileall.compile_file(
+                    target_path, optimize=level, quiet=1, ddir=dir_path_to_embed
+                )
+            return []
+
+        import py_compile
+
+        pyc_records: list[RecordEntry] = []
         for level in self.bytecode_optimization_levels:
-            compileall.compile_file(
-                target_path, optimize=level, quiet=1, ddir=dir_path_to_embed
+            try:
+                # ``dfile`` is the path embedded into the bytecode (eg. in
+                # ``co_filename`` and tracebacks); point it at the final
+                # runtime location rather than the staging directory. The
+                # checked-hash invalidation mode embeds a hash of the source
+                # contents instead of their modification time/size.
+                pyc_filename = py_compile.compile(
+                    str(target_path),
+                    dfile=str(logical_path),
+                    doraise=True,
+                    quiet=1,
+                    optimize=level,
+                    invalidation_mode=(
+                        py_compile.PycInvalidationMode.CHECKED_HASH
+                    ),
+                )
+            except py_compile.PyCompileError as exc:
+                message = (
+                    "Failed to byte-compile"
+                    f" {logical_path} at optimization level {level}: {exc.msg}"
+                )
+                raise BytecodeCompilationError(message) from exc
+
+            assert pyc_filename is not None  # guaranteed with doraise=True
+            pyc_path = Path(pyc_filename)
+            pyc_record_path = posixpath.join(
+                posixpath.dirname(record.path), "__pycache__", pyc_path.name
             )
+            sink = io.BytesIO()
+            with pyc_path.open("rb") as pyc_stream:
+                hash_, size = copyfileobj_with_hashing(
+                    pyc_stream, sink, self.hash_algorithm
+                )
+            pyc_records.append(
+                RecordEntry(
+                    pyc_record_path, Hash(self.hash_algorithm, hash_), size
+                )
+            )
+        return pyc_records
 
     def finalize_installation(
         self,
@@ -297,10 +436,24 @@ class SchemeDictionaryDestination(WheelDestination):
             return path + "/"
 
         record_list = list(records)
+
+        # In reproducible mode, compile bytecode before writing ``RECORD`` so
+        # that every final artifact (including the generated ``.pyc`` files)
+        # is recorded with the hash and size of the bytes actually written.
+        if self.reproducible:
+            pyc_records: list[tuple[Scheme, RecordEntry]] = []
+            for scheme_, record in record_list:
+                pyc_records.extend(
+                    (scheme_, pyc_record)
+                    for pyc_record in self._compile_bytecode(scheme_, record)
+                )
+            record_list.extend(pyc_records)
+
         with construct_record_file(record_list, prefix_for_scheme) as record_stream:
             self.write_to_fs(
                 scheme, record_file_path, record_stream, is_executable=False
             )
 
-        for scheme_, record in record_list:
-            self._compile_bytecode(scheme_, record)
+        if not self.reproducible:
+            for scheme_, record in record_list:
+                self._compile_bytecode(scheme_, record)

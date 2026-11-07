@@ -8,6 +8,7 @@ import io
 import os
 import re
 import sys
+import time
 from collections import namedtuple
 from collections.abc import Callable, Iterable, Iterator
 from configparser import ConfigParser
@@ -22,6 +23,11 @@ from typing import (
     cast,
 )
 
+from installer.exceptions import (
+    InvalidBytecodeOptimizationLevel,
+    InvalidSourceDateEpoch,
+)
+
 if TYPE_CHECKING:
     from installer.records import RecordEntry
     from installer.scripts import LauncherKind, ScriptSection
@@ -29,17 +35,39 @@ if TYPE_CHECKING:
 Scheme = NewType("Scheme", str)
 AllSchemes = tuple[Scheme, ...]
 
+# A date/time representable in the MS-DOS fields of a ZIP archive member, as
+# six UTC values: (year, month, day, hour, minute, second). The seconds field
+# only has a 2-second resolution.
+ZipDateTime = tuple[int, int, int, int, int, int]
+
+# Earliest and latest times representable in a ZIP archive's MS-DOS
+# date/time fields, expressed as POSIX timestamps (UTC).
+ZIP_DATE_TIME_MIN_EPOCH = 315_532_800  # 1980-01-01 00:00:00 UTC
+ZIP_DATE_TIME_MAX_EPOCH = 4_354_819_198  # 2107-12-31 23:59:58 UTC
+_ZIP_DATE_TIME_MIN: ZipDateTime = (1980, 1, 1, 0, 0, 0)
+_ZIP_DATE_TIME_MAX: ZipDateTime = (2107, 12, 31, 23, 59, 58)
+
+#: Fixed timestamp used for reproducible artifacts, when the caller does not
+#: provide ``SOURCE_DATE_EPOCH``. This is 1980-01-01 00:00:00 UTC, the earliest
+#: time that can be represented in a ZIP archive member's date/time fields.
+DEFAULT_SOURCE_DATE_EPOCH: int = ZIP_DATE_TIME_MIN_EPOCH
+
 __all__ = [
+    "DEFAULT_SOURCE_DATE_EPOCH",
     "SCHEME_NAMES",
+    "ZIP_DATE_TIME_MAX_EPOCH",
+    "ZIP_DATE_TIME_MIN_EPOCH",
     "WheelFilename",
     "construct_record_file",
     "copyfileobj_with_hashing",
     "fix_shebang",
     "get_launcher_kind",
     "make_file_executable",
+    "normalize_bytecode_optimization_levels",
     "parse_entrypoints",
     "parse_metadata_file",
     "parse_wheel_filename",
+    "source_date_epoch_to_zip_date_time",
 ]
 
 # Borrowed from https://github.com/python/cpython/blob/v3.9.1/Lib/shutil.py#L52
@@ -270,3 +298,74 @@ def _current_umask() -> int:
 def make_file_executable(path: Path) -> None:
     """Make the file at the provided path executable."""
     path.chmod(0o777 & ~_current_umask() | 0o111)
+
+
+def normalize_bytecode_optimization_levels(
+    levels: Iterable[object],
+) -> tuple[int, ...]:
+    """Validate and de-duplicate bytecode optimization levels.
+
+    Only the levels supported by the Python compiler (``0``, ``1`` and ``2``)
+    are accepted. The returned levels preserve the order of first occurrence.
+
+    :param levels: optimization levels requested by the caller.
+    :raises InvalidBytecodeOptimizationLevel: if any level is not one of
+        ``0``, ``1`` or ``2``.
+    """
+    normalized: list[int] = []
+    for level in levels:
+        # ``bool`` is a subclass of ``int``; reject it explicitly, since
+        # ``True``/``False`` are not valid optimization levels.
+        if type(level) is not int or not (0 <= level <= 2):
+            message = (
+                f"Invalid bytecode optimization level {level!r}:"
+                " expected one of 0, 1 or 2."
+            )
+            raise InvalidBytecodeOptimizationLevel(message)
+        if level not in normalized:
+            normalized.append(level)
+    return tuple(normalized)
+
+
+def source_date_epoch_to_zip_date_time(epoch: object) -> ZipDateTime:
+    """Convert a ``SOURCE_DATE_EPOCH`` value to a ZIP member date/time.
+
+    The value is interpreted in UTC and validated against the range of the
+    MS-DOS date/time fields stored in ZIP archives (1980-01-01 00:00:00 UTC to
+    2107-12-31 23:59:58 UTC).
+
+    :param epoch: POSIX timestamp to use for reproducible archive members.
+    :raises InvalidSourceDateEpoch: if the value is not an integer or cannot
+        be represented in a ZIP archive member's date/time fields.
+    """
+    # ``bool`` is a subclass of ``int``; reject it explicitly.
+    if type(epoch) is not int:
+        message = f"SOURCE_DATE_EPOCH must be an integer, got {epoch!r}."
+        raise InvalidSourceDateEpoch(message)
+
+    try:
+        gmtime = time.gmtime(epoch)
+    except (OverflowError, OSError, ValueError) as exc:
+        message = (
+            f"SOURCE_DATE_EPOCH {epoch} is outside of the range of times"
+            " representable in a ZIP archive (1980-01-01 00:00:00 UTC to"
+            " 2107-12-31 23:59:58 UTC)."
+        )
+        raise InvalidSourceDateEpoch(message) from exc
+
+    date_time: ZipDateTime = (
+        gmtime.tm_year,
+        gmtime.tm_mon,
+        gmtime.tm_mday,
+        gmtime.tm_hour,
+        gmtime.tm_min,
+        gmtime.tm_sec,
+    )
+    if not _ZIP_DATE_TIME_MIN <= date_time <= _ZIP_DATE_TIME_MAX:
+        message = (
+            f"SOURCE_DATE_EPOCH {epoch} ({time.strftime('%Y-%m-%d %H:%M:%S', gmtime)}"
+            " UTC) is outside of the range of times representable in a ZIP"
+            " archive (1980-01-01 00:00:00 UTC to 2107-12-31 23:59:58 UTC)."
+        )
+        raise InvalidSourceDateEpoch(message)
+    return date_time

@@ -8,17 +8,26 @@ from io import BytesIO
 
 import pytest
 
+from installer.exceptions import (
+    InvalidBytecodeOptimizationLevel,
+    InvalidSourceDateEpoch,
+)
 from installer.records import RecordEntry
 from installer.utils import (
+    DEFAULT_SOURCE_DATE_EPOCH,
+    ZIP_DATE_TIME_MAX_EPOCH,
+    ZIP_DATE_TIME_MIN_EPOCH,
     WheelFilename,
     canonicalize_name,
     construct_record_file,
     copyfileobj_with_hashing,
     fix_shebang,
     get_stream_length,
+    normalize_bytecode_optimization_levels,
     parse_entrypoints,
     parse_metadata_file,
     parse_wheel_filename,
+    source_date_epoch_to_zip_date_time,
 )
 
 
@@ -264,3 +273,62 @@ class TestParseEntryPoints:
     def test_valid(self, script, expected):
         iterable = parse_entrypoints(textwrap.dedent(script))
         assert list(iterable) == expected, expected
+
+
+class TestNormalizeBytecodeOptimizationLevels:
+    def test_deduplicates_preserving_order(self):
+        assert normalize_bytecode_optimization_levels([1, 1, 0, 0, 2, 1]) == (
+            1,
+            0,
+            2,
+        )
+
+    def test_empty(self):
+        assert normalize_bytecode_optimization_levels(()) == ()
+
+    @pytest.mark.parametrize("value", [3, -1, 42])
+    def test_rejects_out_of_range_integers(self, value):
+        with pytest.raises(InvalidBytecodeOptimizationLevel):
+            normalize_bytecode_optimization_levels([value])
+
+    @pytest.mark.parametrize("value", [True, False, "0", 1.0, None])
+    def test_rejects_non_integer_levels(self, value):
+        with pytest.raises(InvalidBytecodeOptimizationLevel):
+            normalize_bytecode_optimization_levels([value])
+
+
+class TestSourceDateEpochToZipDateTime:
+    def test_default_constant_is_zip_epoch_minimum(self):
+        assert DEFAULT_SOURCE_DATE_EPOCH == ZIP_DATE_TIME_MIN_EPOCH
+        assert source_date_epoch_to_zip_date_time(
+            DEFAULT_SOURCE_DATE_EPOCH
+        ) == (1980, 1, 1, 0, 0, 0)
+
+    def test_converts_utc(self):
+        assert source_date_epoch_to_zip_date_time(
+            1_700_000_000
+        ) == (2023, 11, 14, 22, 13, 20)
+
+    def test_accepts_boundaries(self):
+        assert source_date_epoch_to_zip_date_time(
+            ZIP_DATE_TIME_MIN_EPOCH
+        ) == (1980, 1, 1, 0, 0, 0)
+        assert source_date_epoch_to_zip_date_time(
+            ZIP_DATE_TIME_MAX_EPOCH
+        ) == (2107, 12, 31, 23, 59, 58)
+
+    @pytest.mark.parametrize(
+        "epoch", [0, -1, ZIP_DATE_TIME_MIN_EPOCH - 1, ZIP_DATE_TIME_MAX_EPOCH + 2]
+    )
+    def test_rejects_out_of_range(self, epoch):
+        with pytest.raises(InvalidSourceDateEpoch):
+            source_date_epoch_to_zip_date_time(epoch)
+
+    @pytest.mark.parametrize("epoch", ["315532800", True, False, 1.0, None])
+    def test_rejects_non_integer(self, epoch):
+        with pytest.raises(InvalidSourceDateEpoch):
+            source_date_epoch_to_zip_date_time(epoch)
+
+    def test_rejects_values_that_overflow_gmtime(self):
+        with pytest.raises(InvalidSourceDateEpoch):
+            source_date_epoch_to_zip_date_time(10**20)

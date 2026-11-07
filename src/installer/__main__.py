@@ -56,6 +56,27 @@ def _get_main_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="silently overwrite existing files",
     )
+    parser.add_argument(
+        "--reproducible",
+        action="store_true",
+        help=(
+            "produce reproducible installation artifacts (checked-hash"
+            " bytecode and fixed Windows launcher ZIP metadata)"
+        ),
+    )
+    parser.add_argument(
+        "--source-date-epoch",
+        metavar="seconds",
+        type=int,
+        default=None,
+        help=(
+            "POSIX timestamp (UTC) to embed in reproducible artifacts;"
+            " requires --reproducible and must be representable in a ZIP"
+            " archive (1980-01-01 to 2107-12-31); defaults to the"
+            " SOURCE_DATE_EPOCH environment variable or a documented fixed"
+            " time"
+        ),
+    )
     return parser
 
 
@@ -96,6 +117,18 @@ def _main(cli_args: Sequence[str], program: str | None = None) -> None:
     elif not bytecode_levels:
         bytecode_levels = [0, 1]
 
+    source_date_epoch = args.source_date_epoch
+    if args.reproducible and source_date_epoch is None:
+        # The command-line flag takes precedence over the environment.
+        env_epoch = os.environ.get("SOURCE_DATE_EPOCH")
+        if env_epoch is not None:
+            try:
+                source_date_epoch = int(env_epoch)
+            except ValueError:
+                parser.error(
+                    f"Invalid SOURCE_DATE_EPOCH environment value: {env_epoch!r}"
+                )
+
     for wheel in args.wheel:
         with WheelFile.open(wheel) as source:
             if args.validate_record != "none":
@@ -107,6 +140,8 @@ def _main(cli_args: Sequence[str], program: str | None = None) -> None:
                 bytecode_optimization_levels=bytecode_levels,
                 destdir=args.destdir,
                 overwrite_existing=args.overwrite_existing,
+                reproducible=args.reproducible,
+                source_date_epoch=source_date_epoch,
             )
             installer.install(source, destination, {})
 
